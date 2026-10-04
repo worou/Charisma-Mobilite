@@ -1,3 +1,4 @@
+import './apiBase.js';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { AdminProvider } from './components/AdminContext.jsx';

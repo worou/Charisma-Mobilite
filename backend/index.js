@@ -1,5 +1,5 @@
 const express = require('express');
-const Database = require('better-sqlite3');
+const Database = require('./db');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -20,7 +20,8 @@ app.use((req, res, next) => {
 });
 
 // ── Database ──────────────────────────────────────────────────────────────────
-const db = new Database(path.join(__dirname, 'charisma_move.db'));
+// DB_PATH permet de placer la base hors du dossier web en production
+const db = new Database(process.env.DB_PATH || path.join(__dirname, 'charisma_move.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
@@ -197,6 +198,8 @@ app.get('/api/auth/me', authenticateToken, (req, res) => {
 // ── OAuth (Google, GitHub) ────────────────────────────────────────────────────
 // Le navigateur passe par le proxy Vite : les URL de callback sont donc sur FRONTEND_URL.
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+// URL publique de l'API (callbacks OAuth). En local, le proxy Vite la sert sous FRONTEND_URL.
+const API_PUBLIC_URL = process.env.API_PUBLIC_URL || FRONTEND_URL;
 
 const OAUTH_PROVIDERS = {
   google: {
@@ -238,7 +241,7 @@ const OAUTH_PROVIDERS = {
   },
 };
 
-const oauthCallbackUrl = (provider) => `${FRONTEND_URL}/api/auth/${provider}/callback`;
+const oauthCallbackUrl = (provider) => `${API_PUBLIC_URL}/api/auth/${provider}/callback`;
 const oauthFail = (res, message) => res.redirect(`${FRONTEND_URL}/#oauth_error=${encodeURIComponent(message)}`);
 const readCookie = (req, name) =>
   (req.headers.cookie || '').split(';').map(c => c.trim().split('=')).find(([k]) => k === name)?.[1];

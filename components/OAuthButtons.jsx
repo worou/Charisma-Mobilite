@@ -1,5 +1,6 @@
 import React from 'react';
 import { Github } from 'lucide-react';
+import { apiUrl } from '../apiBase.js';
 
 // Navigation pleine page : le backend redirige vers Google/GitHub puis revient sur le site.
 const GoogleIcon = () => (
@@ -19,14 +20,14 @@ const OAuthButtons = () => (
       <span className="flex-1 h-px bg-gray-200" />
     </div>
     <a
-      href="/api/auth/google"
+      href={apiUrl('/api/auth/google')}
       className="w-full flex items-center justify-center gap-3 border-2 border-gray-200 py-3 rounded-xl font-semibold text-gray-700 hover:bg-gray-50 transition-colors"
     >
       <GoogleIcon />
       Continuer avec Google
     </a>
     <a
-      href="/api/auth/github"
+      href={apiUrl('/api/auth/github')}
       className="w-full flex items-center justify-center gap-3 bg-gray-900 py-3 rounded-xl font-semibold text-white hover:bg-gray-800 transition-colors"
     >
       <Github className="w-5 h-5" />
