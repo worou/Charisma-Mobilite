@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "db:tunnel": "node scripts/db-tunnel.js",
+    "db:migrate-sqlite": "node scripts/migrate-sqlite-to-mysql.js"
   },
   "keywords": [],
   "author": "",
@@ -16,11 +18,12 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.1",
+    "mysql2": "^3.24.5",
     "nodemailer": "^10.0.14",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^4.6.2"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": ">=18"
   }
 }

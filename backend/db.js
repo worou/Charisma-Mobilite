@@ -1,54 +1,66 @@
-// SQLite intégré à Node (node:sqlite, Node ≥ 22.13) derrière l'interface de better-sqlite3
-// utilisée par index.js. Aucun module natif à compiler : l'hébergement o2switch n'autorise
-// pas la compilation et sa glibc (2.28) est trop ancienne pour les binaires de better-sqlite3.
-const { DatabaseSync } = require('node:sqlite');
+// Accès MySQL / MariaDB (pool mysql2) avec une interface proche de l'ancienne version SQLite :
+//   await db.get(sql, ...params)  -> première ligne ou undefined
+//   await db.all(sql, ...params)  -> tableau de lignes
+//   await db.run(sql, ...params)  -> { changes, lastInsertRowid }
+//   await db.transaction(async (tx) => { ... tx.get / tx.all / tx.run ... })
+const mysql = require('mysql2/promise');
 
-// better-sqlite3 lie `undefined` comme NULL ; node:sqlite le refuse. Le code s'appuie
-// sur ce comportement (ex. COALESCE(?, colonne) pour les mises à jour partielles).
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || '127.0.0.1',
+  port: parseInt(process.env.DB_PORT) || 3306,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  charset: 'utf8mb4',
+  connectionLimit: parseInt(process.env.DB_POOL_SIZE) || 5,
+  // Mêmes formats que l'API renvoyait avec SQLite : dates en texte, sommes en nombres
+  dateStrings: true,
+  decimalNumbers: true,
+  timezone: 'Z',
+});
+
+// Horodatages (created_at) stockés et relus en UTC, comme datetime('now') sous SQLite
+pool.on('connection', (conn) => conn.query("SET time_zone = '+00:00'"));
+
+// mysql2 refuse `undefined` ; le code s'appuie sur undefined -> NULL (ex. COALESCE(?, colonne))
 const bindable = (params) => params.map((p) => (p === undefined ? null : p));
 
-class Statement {
-  constructor(stmt) {
-    this.stmt = stmt;
-  }
-  run(...params) { return this.stmt.run(...bindable(params)); }
-  get(...params) { return this.stmt.get(...bindable(params)); }
-  all(...params) { return this.stmt.all(...bindable(params)); }
-}
+const queries = (conn) => ({
+  async all(sql, ...params) {
+    const [rows] = await conn.query(sql, bindable(params));
+    return rows;
+  },
+  async get(sql, ...params) {
+    const [rows] = await conn.query(sql, bindable(params));
+    return rows[0];
+  },
+  async run(sql, ...params) {
+    const [result] = await conn.query(sql, bindable(params));
+    return { changes: result.affectedRows, lastInsertRowid: result.insertId };
+  },
+});
 
-class Database {
-  constructor(filename) {
-    this.db = new DatabaseSync(filename);
-    this.depth = 0;
-  }
+const db = {
+  ...queries(pool),
+  pool,
 
-  prepare(sql) { return new Statement(this.db.prepare(sql)); }
+  // Exécute fn dans une transaction sur une connexion dédiée ; annulée si fn lève une exception
+  async transaction(fn) {
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const result = await fn(queries(conn));
+      await conn.commit();
+      return result;
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  },
 
-  exec(sql) { this.db.exec(sql); return this; }
+  close: () => pool.end(),
+};
 
-  pragma(source) { this.db.exec(`PRAGMA ${source}`); }
-
-  close() { this.db.close(); }
-
-  // Comme better-sqlite3 : renvoie une fonction exécutée dans une transaction,
-  // annulée si elle lève une exception. Les appels imbriqués utilisent des SAVEPOINT.
-  transaction(fn) {
-    return (...args) => {
-      const savepoint = `sp_${this.depth}`;
-      this.db.exec(this.depth === 0 ? 'BEGIN' : `SAVEPOINT ${savepoint}`);
-      this.depth++;
-      try {
-        const result = fn(...args);
-        this.depth--;
-        this.db.exec(this.depth === 0 ? 'COMMIT' : `RELEASE ${savepoint}`);
-        return result;
-      } catch (err) {
-        this.depth--;
-        this.db.exec(this.depth === 0 ? 'ROLLBACK' : `ROLLBACK TO ${savepoint}; RELEASE ${savepoint}`);
-        throw err;
-      }
-    };
-  }
-}
-
-module.exports = Database;
+module.exports = db;

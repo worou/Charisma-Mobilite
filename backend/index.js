@@ -1,12 +1,12 @@
+require('dotenv').config();
 const express = require('express');
-const Database = require('./db');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const path = require('path');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-require('dotenv').config();
+const db = require('./db');
+const { initSchema } = require('./schema');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -19,110 +19,47 @@ app.use((req, res, next) => {
   next();
 });
 
+// Express 4 ne relaie pas les erreurs des handlers async : sans ce relais, une erreur
+// MySQL deviendrait une promesse rejetée non gérée, qui arrête le processus Node.
+for (const method of ['get', 'post', 'put', 'delete']) {
+  const register = app[method].bind(app);
+  app[method] = (path, ...handlers) => {
+    if (handlers.length === 0) return register(path); // app.get('réglage')
+    return register(path, ...handlers.map((h) => (req, res, next) => {
+      try {
+        const out = h(req, res, next);
+        if (out && typeof out.catch === 'function') out.catch(next);
+      } catch (err) {
+        next(err);
+      }
+    }));
+  };
+}
+
 // ── Database ──────────────────────────────────────────────────────────────────
-// DB_PATH permet de placer la base hors du dossier web en production
-const db = new Database(process.env.DB_PATH || path.join(__dirname, 'charisma_move.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+async function initDatabase() {
+  await initSchema(db);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL,
-    first_name TEXT,
-    gender     TEXT,
-    email      TEXT NOT NULL UNIQUE,
-    password   TEXT NOT NULL,
-    phone      TEXT,
-    is_admin   INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS items (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS bookings (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
-    departure   TEXT,
-    arrival     TEXT,
-    travel_date TEXT,
-    travel_time TEXT,
-    seats       INTEGER,
-    price       REAL DEFAULT 0,
-    status      TEXT DEFAULT 'pending',
-    created_at  TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS announcements (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
-    departure   TEXT NOT NULL,
-    destination TEXT NOT NULL,
-    datetime    TEXT NOT NULL,
-    seats       INTEGER NOT NULL,
-    price       REAL,
-    description TEXT,
-    created_at  TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-`);
-
-// Bus de l'Église : l'admin crée les lignes, les places sont comptées par date de culte
-db.exec(`
-  CREATE TABLE IF NOT EXISTS bus_lines (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL UNIQUE,
-    seats      INTEGER NOT NULL CHECK (seats > 0),
-    active     INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS bus_bookings (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    line_id      INTEGER NOT NULL,
-    user_id      INTEGER NOT NULL,
-    service_date TEXT NOT NULL,
-    seats        INTEGER NOT NULL CHECK (seats > 0),
-    created_at   TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (line_id) REFERENCES bus_lines(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-  CREATE INDEX IF NOT EXISTS idx_bus_bookings_line_date ON bus_bookings(line_id, service_date);
-
-  CREATE TABLE IF NOT EXISTS notifications (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL,
-    title      TEXT NOT NULL,
-    message    TEXT NOT NULL,
-    is_read    INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-`);
-
-// CREATE TABLE IF NOT EXISTS n'ajoute pas de colonne à une base déjà créée :
-// on rattache les réservations au trajet réservé par une migration explicite.
-if (!db.prepare('PRAGMA table_info(bookings)').all().some(c => c.name === 'announcement_id')) {
-  db.exec('ALTER TABLE bookings ADD COLUMN announcement_id INTEGER REFERENCES announcements(id)');
-  console.log('Migration : bookings.announcement_id ajouté');
+  // Seed default admin
+  const adminCount = await db.get('SELECT COUNT(*) as c FROM users WHERE is_admin = 1');
+  if (adminCount.c === 0) {
+    const email    = process.env.ADMIN_EMAIL    || 'admin@example.com';
+    const password = process.env.ADMIN_PASSWORD || 'admin123';
+    const name     = process.env.ADMIN_NAME     || 'Admin';
+    const hash     = await bcrypt.hash(password, 12);
+    await db.run('INSERT INTO users (name, email, password, is_admin) VALUES (?, ?, ?, 1)', name, email, hash);
+    console.log(`Admin créé: ${email}`);
+  }
+  console.log('Base de données MySQL prête');
 }
 
-// Seed default admin
-const adminCount = db.prepare('SELECT COUNT(*) as c FROM users WHERE is_admin = 1').get();
-if (adminCount.c === 0) {
-  const email    = process.env.ADMIN_EMAIL    || 'admin@example.com';
-  const password = process.env.ADMIN_PASSWORD || 'admin123';
-  const name     = process.env.ADMIN_NAME     || 'Admin';
-  const hash     = bcrypt.hashSync(password, 12);
-  db.prepare('INSERT INTO users (name, email, password, is_admin) VALUES (?, ?, ?, 1)').run(name, email, hash);
-  console.log(`Admin créé: ${email}`);
-}
-console.log('Base de données SQLite prête');
+// Date et heure locales au format des trajets (« AAAA-MM-JJTHH:MM »)
+const pad2 = (n) => String(n).padStart(2, '0');
+const nowLocalMinute = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
+
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'secret';
@@ -148,16 +85,16 @@ function authenticateAdmin(req, res, next) {
 }
 
 // ── Items ─────────────────────────────────────────────────────────────────────
-app.get('/api/items', (req, res) => {
+app.get('/api/items', async (req, res) => {
   const { q } = req.query;
   const rows = q
-    ? db.prepare('SELECT id, name FROM items WHERE LOWER(name) LIKE ?').all(`%${q.toLowerCase()}%`)
-    : db.prepare('SELECT id, name FROM items').all();
+    ? await db.all('SELECT id, name FROM items WHERE LOWER(name) LIKE ?', `%${q.toLowerCase()}%`)
+    : await db.all('SELECT id, name FROM items');
   res.json(rows);
 });
 
-app.post('/api/items', (req, res) => {
-  const result = db.prepare('INSERT INTO items (name) VALUES (?)').run(req.body.name);
+app.post('/api/items', async (req, res) => {
+  const result = await db.run('INSERT INTO items (name) VALUES (?)', req.body.name);
   res.status(201).json({ id: result.lastInsertRowid, name: req.body.name });
 });
 
@@ -165,20 +102,18 @@ app.post('/api/items', (req, res) => {
 app.post('/api/users/register', async (req, res) => {
   const { name, first_name, gender, email, password, phone } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
-  if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
+  if (await db.get('SELECT id FROM users WHERE email = ?', email)) {
     return res.status(409).json({ error: 'Email already in use' });
   }
   const hash   = await bcrypt.hash(password, 10);
-  const result = db.prepare(
-    'INSERT INTO users (name, first_name, gender, email, password, phone) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(name, first_name || null, gender || null, email, hash, phone || null);
+  const result = await db.run('INSERT INTO users (name, first_name, gender, email, password, phone) VALUES (?, ?, ?, ?, ?, ?)', name, first_name || null, gender || null, email, hash, phone || null);
   res.status(201).json({ id: result.lastInsertRowid, name, first_name, gender, email, phone, is_admin: false });
 });
 
 app.post(['/api/users/login', '/api/auth/login'], async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const user = await db.get('SELECT * FROM users WHERE email = ?', email);
   if (!user || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
@@ -189,8 +124,8 @@ app.post(['/api/users/login', '/api/auth/login'], async (req, res) => {
   });
 });
 
-app.get('/api/auth/me', authenticateToken, (req, res) => {
-  const user = db.prepare('SELECT id, name, first_name, gender, email, phone, is_admin FROM users WHERE id = ?').get(req.user.id);
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  const user = await db.get('SELECT id, name, first_name, gender, email, phone, is_admin FROM users WHERE id = ?', req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({ user });
 });
@@ -246,7 +181,7 @@ const oauthFail = (res, message) => res.redirect(`${FRONTEND_URL}/#oauth_error=$
 const readCookie = (req, name) =>
   (req.headers.cookie || '').split(';').map(c => c.trim().split('=')).find(([k]) => k === name)?.[1];
 
-app.get('/api/auth/:provider', (req, res, next) => {
+app.get('/api/auth/:provider', async (req, res, next) => {
   const cfg = OAUTH_PROVIDERS[req.params.provider];
   if (!cfg) return next();
   if (!cfg.clientId || !cfg.clientSecret) return oauthFail(res, `Connexion ${cfg.label} non configurée`);
@@ -288,13 +223,12 @@ app.get('/api/auth/:provider/callback', async (req, res, next) => {
     if (!tokenData.access_token) throw new Error('Échange du code refusé');
 
     const profile = await cfg.fetchProfile(tokenData.access_token);
-    let user = db.prepare('SELECT * FROM users WHERE email = ?').get(profile.email);
+    let user = await db.get('SELECT * FROM users WHERE email = ?', profile.email);
     if (!user) {
       // Mot de passe aléatoire inutilisable : la colonne est NOT NULL, le compte se connecte via OAuth
       const hash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
-      const result = db.prepare('INSERT INTO users (name, first_name, email, password) VALUES (?, ?, ?, ?)')
-        .run(profile.name, profile.first_name, profile.email, hash);
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid);
+      const result = await db.run('INSERT INTO users (name, first_name, email, password) VALUES (?, ?, ?, ?)', profile.name, profile.first_name, profile.email, hash);
+      user = await db.get('SELECT * FROM users WHERE id = ?', result.lastInsertRowid);
     }
     const token = jwt.sign({ id: user.id, is_admin: !!user.is_admin }, JWT_SECRET, { expiresIn: '1h' });
     // Fragment (#) : le jeton n'est envoyé à aucun serveur ni journalisé
@@ -305,18 +239,17 @@ app.get('/api/auth/:provider/callback', async (req, res, next) => {
   }
 });
 
-app.get('/api/users/:id', authenticateToken, (req, res) => {
+app.get('/api/users/:id', authenticateToken, async (req, res) => {
   if (parseInt(req.params.id) !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
-  const user = db.prepare('SELECT id, name, first_name, gender, email, phone, is_admin FROM users WHERE id = ?').get(req.user.id);
+  const user = await db.get('SELECT id, name, first_name, gender, email, phone, is_admin FROM users WHERE id = ?', req.user.id);
   res.json(user || {});
 });
 
-app.put('/api/users/:id', authenticateToken, (req, res) => {
+app.put('/api/users/:id', authenticateToken, async (req, res) => {
   if (parseInt(req.params.id) !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
   const { name, first_name, gender, phone } = req.body;
-  db.prepare('UPDATE users SET name = COALESCE(?, name), first_name = COALESCE(?, first_name), gender = COALESCE(?, gender), phone = COALESCE(?, phone) WHERE id = ?')
-    .run(name, first_name, gender, phone, req.user.id);
-  const user = db.prepare('SELECT id, name, first_name, gender, email, phone, is_admin FROM users WHERE id = ?').get(req.user.id);
+  await db.run('UPDATE users SET name = COALESCE(?, name), first_name = COALESCE(?, first_name), gender = COALESCE(?, gender), phone = COALESCE(?, phone) WHERE id = ?', name, first_name, gender, phone, req.user.id);
+  const user = await db.get('SELECT id, name, first_name, gender, email, phone, is_admin FROM users WHERE id = ?', req.user.id);
   res.json(user);
 });
 
@@ -324,7 +257,7 @@ app.put('/api/users/:id', authenticateToken, (req, res) => {
 app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
-  const user = db.prepare('SELECT * FROM users WHERE email = ? AND is_admin = 1').get(email);
+  const user = await db.get('SELECT * FROM users WHERE email = ? AND is_admin = 1', email);
   if (!user || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
@@ -333,98 +266,96 @@ app.post('/api/admin/login', async (req, res) => {
 });
 
 // ── Admin: users ──────────────────────────────────────────────────────────────
-app.get('/api/admin/users', authenticateAdmin, (req, res) => {
-  res.json(db.prepare('SELECT id, name, first_name, email, phone, is_admin FROM users ORDER BY id ASC').all());
+app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
+  res.json(await db.all('SELECT id, name, first_name, email, phone, is_admin FROM users ORDER BY id ASC'));
 });
 
 app.post('/api/admin/users', authenticateAdmin, async (req, res) => {
   const { name, email, password, phone } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
   if (password.length < 8) return res.status(400).json({ error: 'Password too short' });
-  if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
+  if (await db.get('SELECT id FROM users WHERE email = ?', email)) {
     return res.status(409).json({ error: 'Email already in use' });
   }
   const hash = await bcrypt.hash(password, 12);
   let result;
   try {
-    result = db.prepare(
-      'INSERT INTO users (name, email, password, phone, is_admin) VALUES (?, ?, ?, ?, 1)'
-    ).run(name, email, hash, phone || null);
+    result = await db.run('INSERT INTO users (name, email, password, phone, is_admin) VALUES (?, ?, ?, ?, 1)', name, email, hash, phone || null);
   } catch (e) {
     // email est UNIQUE : rattrape la collision entre le pré-contrôle et l'insertion
-    if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') return res.status(409).json({ error: 'Email already in use' });
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Email already in use' });
     throw e;
   }
   res.status(201).json({ id: result.lastInsertRowid, name, email, phone: phone || null, is_admin: true });
 });
 
-app.delete('/api/admin/users/:id', authenticateAdmin, (req, res) => {
-  db.prepare('DELETE FROM users WHERE id = ? AND is_admin = 0').run(req.params.id);
+app.delete('/api/admin/users/:id', authenticateAdmin, async (req, res) => {
+  await db.run('DELETE FROM users WHERE id = ? AND is_admin = 0', req.params.id);
   res.json({ success: true });
 });
 
 // ── Admin: stats ──────────────────────────────────────────────────────────────
-app.get('/api/admin/stats', authenticateAdmin, (req, res) => {
-  const total_users    = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-  const total_trips    = db.prepare('SELECT COUNT(*) as c FROM announcements').get().c;
-  const total_bookings = db.prepare('SELECT COUNT(*) as c FROM bookings').get().c;
-  const active_trips   = db.prepare("SELECT COUNT(*) as c FROM announcements WHERE datetime > datetime('now')").get().c;
-  res.json({ total_users, total_trips, total_bookings, active_trips });
+app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
+  const stats = await db.get(`
+    SELECT (SELECT COUNT(*) FROM users)                             AS total_users,
+           (SELECT COUNT(*) FROM announcements)                     AS total_trips,
+           (SELECT COUNT(*) FROM bookings)                          AS total_bookings,
+           (SELECT COUNT(*) FROM announcements WHERE datetime > ?)  AS active_trips
+  `, nowLocalMinute());
+  res.json(stats);
 });
 
 // ── Admin: announcements ──────────────────────────────────────────────────────
-app.get('/api/admin/announcements', authenticateAdmin, (req, res) => {
-  res.json(db.prepare(`
+app.get('/api/admin/announcements', authenticateAdmin, async (req, res) => {
+  res.json(await db.all(`
     SELECT a.*, u.name as driver_name, u.email as driver_email
     FROM announcements a JOIN users u ON a.user_id = u.id
     ORDER BY a.datetime DESC
-  `).all());
+  `));
 });
 
-app.delete('/api/admin/announcements/:id', authenticateAdmin, (req, res) => {
-  db.prepare('DELETE FROM announcements WHERE id = ?').run(req.params.id);
+app.delete('/api/admin/announcements/:id', authenticateAdmin, async (req, res) => {
+  await db.run('DELETE FROM announcements WHERE id = ?', req.params.id);
   res.json({ success: true });
 });
 
 // ── Admin: bookings ───────────────────────────────────────────────────────────
-app.get('/api/admin/bookings', authenticateAdmin, (req, res) => {
-  res.json(db.prepare(`
+app.get('/api/admin/bookings', authenticateAdmin, async (req, res) => {
+  res.json(await db.all(`
     SELECT b.*, u.name as user_name, u.email as user_email
     FROM bookings b JOIN users u ON b.user_id = u.id
     ORDER BY b.created_at DESC
-  `).all());
+  `));
 });
 
 // ── Announcements ─────────────────────────────────────────────────────────────
-app.post('/api/announcements', authenticateToken, (req, res) => {
+app.post('/api/announcements', authenticateToken, async (req, res) => {
   const { departure, destination, datetime, description } = req.body;
   const seats = parseInt(req.body.seats);
   if (!departure?.trim() || !destination?.trim() || !datetime || !seats) return res.status(400).json({ error: 'Missing fields' });
   if (seats < 1 || seats > 8) return res.status(400).json({ error: 'Le nombre de places doit être entre 1 et 8' });
   if (new Date(datetime) <= new Date()) return res.status(400).json({ error: 'La date de départ doit être dans le futur' });
   // Token encore valide mais compte supprimé : sinon la contrainte FOREIGN KEY fait planter l'INSERT
-  if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(req.user.id)) {
+  if (!await db.get('SELECT 1 FROM users WHERE id = ?', req.user.id)) {
     return res.status(401).json({ error: 'User not found' });
   }
   // Le covoiturage est gratuit : aucun prix n'est enregistré
-  const result = db.prepare(
-    'INSERT INTO announcements (user_id, departure, destination, datetime, seats, description) VALUES (?, ?, ?, ?, ?, ?)'
-  ).run(req.user.id, departure.trim(), destination.trim(), datetime, seats, description?.trim() || null);
+  const result = await db.run('INSERT INTO announcements (user_id, departure, destination, datetime, seats, description) VALUES (?, ?, ?, ?, ?, ?)', req.user.id, departure.trim(), destination.trim(), datetime, seats, description?.trim() || null);
   res.status(201).json({ id: result.lastInsertRowid, departure, destination, datetime, seats, description });
 });
 
 // Trajets publiés par l'utilisateur connecté, avec les places déjà réservées
-app.get('/api/announcements/mine', authenticateToken, (req, res) => {
-  res.json(db.prepare(`
+app.get('/api/announcements/mine', authenticateToken, async (req, res) => {
+  res.json(await db.all(`
     SELECT a.id, a.departure, a.destination, a.datetime, a.seats, a.description, a.created_at,
            COALESCE((SELECT SUM(b.seats) FROM bookings b WHERE b.announcement_id = a.id), 0) AS booked_seats
     FROM announcements a
     WHERE a.user_id = ?
     ORDER BY a.datetime DESC
-  `).all(req.user.id));
+  `, req.user.id));
 });
 
-app.get('/api/announcements', (req, res) => {
+app.get('/api/announcements', async (req, res) => {
   // route publique : on expose le nom du conducteur, jamais son email ni son user_id
   let query = `
     SELECT a.id, a.departure, a.destination, a.datetime, a.seats, a.price, a.description, u.name AS driver_name
@@ -434,25 +365,27 @@ app.get('/api/announcements', (req, res) => {
   if (req.query.departure)   { query += ' AND LOWER(a.departure) LIKE ?';   params.push(`%${req.query.departure.toLowerCase()}%`); }
   if (req.query.destination) { query += ' AND LOWER(a.destination) LIKE ?'; params.push(`%${req.query.destination.toLowerCase()}%`); }
   if (req.query.seats)       { query += ' AND a.seats >= ?';                params.push(parseInt(req.query.seats)); }
-  if (req.query.date)        { query += ' AND date(a.datetime) = ?';        params.push(req.query.date); }
+  if (req.query.date)        { query += ' AND LEFT(a.datetime, 10) = ?';    params.push(req.query.date); }
   query += ' ORDER BY a.datetime ASC';
-  res.json(db.prepare(query).all(...params));
+  res.json(await db.all(query, ...params));
 });
 
 // ── Bookings ──────────────────────────────────────────────────────────────────
 // Réserver décrémente les places restantes du trajet. Les colonnes à plat
 // (departure/arrival/travel_date/travel_time) sont dérivées du trajet et non
 // envoyées par le client : MyBookingsPage et l'admin les lisent encore.
-const bookSeats = db.transaction((userId, announcementId, seats) => {
-  const trip = db.prepare('SELECT * FROM announcements WHERE id = ?').get(announcementId);
+// FOR UPDATE verrouille le trajet : deux réservations simultanées ne peuvent pas dépasser les places.
+const bookSeats = (userId, announcementId, seats) => db.transaction(async (tx) => {
+  const trip = await tx.get('SELECT * FROM announcements WHERE id = ? FOR UPDATE', announcementId);
   if (!trip) return { error: 'Trip not found', status: 404 };
   if (seats > trip.seats) return { error: 'Not enough seats', status: 409, available: trip.seats };
 
   const [travel_date, travel_time] = String(trip.datetime).split('T');
-  db.prepare('UPDATE announcements SET seats = seats - ? WHERE id = ?').run(seats, announcementId);
-  const result = db.prepare(
-    'INSERT INTO bookings (user_id, announcement_id, departure, arrival, travel_date, travel_time, seats, price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(userId, announcementId, trip.departure, trip.destination, travel_date, travel_time || null, seats, trip.price || 0);
+  await tx.run('UPDATE announcements SET seats = seats - ? WHERE id = ?', seats, announcementId);
+  const result = await tx.run(
+    'INSERT INTO bookings (user_id, announcement_id, departure, arrival, travel_date, travel_time, seats, price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    userId, announcementId, trip.departure, trip.destination, travel_date, travel_time || null, seats, trip.price || 0
+  );
 
   return {
     booking: {
@@ -470,47 +403,45 @@ const bookSeats = db.transaction((userId, announcementId, seats) => {
   };
 });
 
-app.post('/api/bookings', authenticateToken, (req, res) => {
+app.post('/api/bookings', authenticateToken, async (req, res) => {
   const announcement_id = parseInt(req.body.announcement_id);
   const seats = parseInt(req.body.seats);
   if (!announcement_id) return res.status(400).json({ error: 'Missing announcement_id' });
   if (!seats || seats < 1) return res.status(400).json({ error: 'Invalid seats' });
 
-  const out = bookSeats(req.user.id, announcement_id, seats);
+  const out = await bookSeats(req.user.id, announcement_id, seats);
   if (out.error) return res.status(out.status).json({ error: out.error, available: out.available });
   res.status(201).json({ ...out.booking, seats_left: out.seats_left });
 });
 
-app.get('/api/bookings', authenticateToken, (req, res) => {
-  res.json(db.prepare(
-    'SELECT id, departure, arrival, travel_date, travel_time, seats, price, status, created_at FROM bookings WHERE user_id = ? ORDER BY created_at DESC'
-  ).all(req.user.id));
+app.get('/api/bookings', authenticateToken, async (req, res) => {
+  res.json(await db.all('SELECT id, departure, arrival, travel_date, travel_time, seats, price, status, created_at FROM bookings WHERE user_id = ? ORDER BY created_at DESC', req.user.id));
 });
 
 // Ne touche pas aux places : elles sont déjà déduites à la création de la réservation.
 // L'admin confirme n'importe quelle réservation (AdminBookings), un utilisateur
 // seulement les siennes.
-app.post('/api/bookings/:id/confirm', authenticateToken, (req, res) => {
+app.post('/api/bookings/:id/confirm', authenticateToken, async (req, res) => {
   const result = req.user.is_admin
-    ? db.prepare("UPDATE bookings SET status = 'confirmed' WHERE id = ?").run(req.params.id)
-    : db.prepare("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND user_id = ?").run(req.params.id, req.user.id);
+    ? await db.run("UPDATE bookings SET status = 'confirmed' WHERE id = ?", req.params.id)
+    : await db.run("UPDATE bookings SET status = 'confirmed' WHERE id = ? AND user_id = ?", req.params.id, req.user.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Booking not found' });
   res.json({ success: true });
 });
 
 // Annuler rend les places au trajet, sinon elles seraient perdues définitivement.
-const cancelBooking = db.transaction((bookingId, userId) => {
-  const booking = db.prepare('SELECT * FROM bookings WHERE id = ? AND user_id = ?').get(bookingId, userId);
+const cancelBooking = (bookingId, userId) => db.transaction(async (tx) => {
+  const booking = await tx.get('SELECT * FROM bookings WHERE id = ? AND user_id = ? FOR UPDATE', bookingId, userId);
   if (!booking) return { deleted: false };
-  db.prepare('DELETE FROM bookings WHERE id = ?').run(bookingId);
+  await tx.run('DELETE FROM bookings WHERE id = ?', bookingId);
   if (booking.announcement_id) {
-    db.prepare('UPDATE announcements SET seats = seats + ? WHERE id = ?').run(booking.seats, booking.announcement_id);
+    await tx.run('UPDATE announcements SET seats = seats + ? WHERE id = ?', booking.seats, booking.announcement_id);
   }
   return { deleted: true };
 });
 
-app.delete('/api/bookings/:id', authenticateToken, (req, res) => {
-  const { deleted } = cancelBooking(parseInt(req.params.id), req.user.id);
+app.delete('/api/bookings/:id', authenticateToken, async (req, res) => {
+  const { deleted } = await cancelBooking(parseInt(req.params.id), req.user.id);
   if (!deleted) return res.status(404).json({ error: 'Booking not found' });
   res.json({ success: true });
 });
@@ -526,9 +457,9 @@ const mailer = process.env.SMTP_HOST
     })
   : null;
 
-function notifyUser(userId, title, message) {
-  db.prepare('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)').run(userId, title, message);
-  const user = db.prepare('SELECT email, first_name, name FROM users WHERE id = ?').get(userId);
+async function notifyUser(userId, title, message) {
+  await db.run('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', userId, title, message);
+  const user = await db.get('SELECT email, first_name, name FROM users WHERE id = ?', userId);
   if (!mailer || !user) return;
   // Envoi en arrière-plan : un échec SMTP ne doit pas bloquer la réponse au voyageur
   mailer.sendMail({
@@ -539,14 +470,12 @@ function notifyUser(userId, title, message) {
   }).catch(err => console.error('Email non envoyé :', err.message));
 }
 
-app.get('/api/notifications', authenticateToken, (req, res) => {
-  res.json(db.prepare(
-    'SELECT id, title, message, is_read, created_at FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 50'
-  ).all(req.user.id));
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  res.json(await db.all('SELECT id, title, message, is_read, created_at FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 50', req.user.id));
 });
 
-app.post('/api/notifications/read', authenticateToken, (req, res) => {
-  db.prepare('UPDATE notifications SET is_read = 1 WHERE user_id = ?').run(req.user.id);
+app.post('/api/notifications/read', authenticateToken, async (req, res) => {
+  await db.run('UPDATE notifications SET is_read = 1 WHERE user_id = ?', req.user.id);
   res.json({ success: true });
 });
 
@@ -559,76 +488,85 @@ const todayLocal = () => {
 const formatServiceDate = (d) =>
   new Date(`${d}T12:00`).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 
-const reservedSeats = (lineId, date) =>
-  db.prepare('SELECT COALESCE(SUM(seats), 0) AS n FROM bus_bookings WHERE line_id = ? AND service_date = ?').get(lineId, date).n;
+// q : db ou la transaction en cours
+const reservedSeats = async (lineId, date, q = db) =>
+  (await q.get('SELECT COALESCE(SUM(seats), 0) AS n FROM bus_bookings WHERE line_id = ? AND service_date = ?', lineId, date)).n;
 
 // Lignes actives et places restantes pour une date donnée
-app.get('/api/bus-lines', (req, res) => {
+app.get('/api/bus-lines', async (req, res) => {
   const date = isServiceDate(req.query.date) ? req.query.date : null;
-  const lines = db.prepare('SELECT id, name, seats FROM bus_lines WHERE active = 1 ORDER BY name').all();
-  res.json(lines.map(l => {
-    const reserved = date ? reservedSeats(l.id, date) : 0;
-    return { ...l, reserved, available: Math.max(l.seats - reserved, 0) };
-  }));
+  const lines = await db.all(`
+    SELECT l.id, l.name, l.seats, COALESCE(SUM(b.seats), 0) AS reserved
+    FROM bus_lines l LEFT JOIN bus_bookings b ON b.line_id = l.id AND b.service_date = ?
+    WHERE l.active = 1
+    GROUP BY l.id, l.name, l.seats
+    ORDER BY l.name
+  `, date);
+  res.json(lines.map(l => ({ ...l, available: Math.max(l.seats - l.reserved, 0) })));
 });
 
-// Vérification et insertion dans la même transaction : deux réservations simultanées ne peuvent pas dépasser la capacité
-const bookBus = db.transaction((userId, lineId, date, seats) => {
-  const line = db.prepare('SELECT * FROM bus_lines WHERE id = ? AND active = 1').get(lineId);
+// Vérification et insertion dans la même transaction. FOR UPDATE verrouille la ligne :
+// deux réservations simultanées ne peuvent pas dépasser la capacité.
+const bookBus = (userId, lineId, date, seats) => db.transaction(async (tx) => {
+  const line = await tx.get('SELECT * FROM bus_lines WHERE id = ? AND active = 1 FOR UPDATE', lineId);
   if (!line) return { status: 404, error: 'Ligne introuvable' };
-  const available = Math.max(line.seats - reservedSeats(lineId, date), 0);
+  const available = Math.max(line.seats - await reservedSeats(lineId, date, tx), 0);
   if (seats > available) return { status: 409, full: true, line, available };
-  const result = db.prepare('INSERT INTO bus_bookings (line_id, user_id, service_date, seats) VALUES (?, ?, ?, ?)')
-    .run(lineId, userId, date, seats);
+  const result = await tx.run('INSERT INTO bus_bookings (line_id, user_id, service_date, seats) VALUES (?, ?, ?, ?)', lineId, userId, date, seats);
   return { booking: { id: result.lastInsertRowid, line_id: lineId, line_name: line.name, service_date: date, seats }, available: available - seats };
 });
 
-app.post('/api/bus-bookings', authenticateToken, (req, res) => {
+app.post('/api/bus-bookings', authenticateToken, async (req, res) => {
   const lineId = parseInt(req.body.line_id);
   const seats = parseInt(req.body.seats);
   const date = req.body.date;
   if (!lineId || !seats || seats < 1) return res.status(400).json({ error: 'Ligne et nombre de places requis' });
   if (!isServiceDate(date)) return res.status(400).json({ error: 'Date invalide' });
   if (date < todayLocal()) return res.status(400).json({ error: 'La date doit être aujourd\'hui ou plus tard' });
-  if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(req.user.id)) return res.status(401).json({ error: 'User not found' });
+  if (!await db.get('SELECT 1 FROM users WHERE id = ?', req.user.id)) return res.status(401).json({ error: 'User not found' });
 
-  const result = bookBus(req.user.id, lineId, date, seats);
+  const result = await bookBus(req.user.id, lineId, date, seats);
   if (result.full) {
     const message = result.available === 0
       ? `Il n'y a plus de places disponibles sur la ligne « ${result.line.name} » pour le ${formatServiceDate(date)}.`
       : `Il ne reste que ${result.available} place(s) sur la ligne « ${result.line.name} » pour le ${formatServiceDate(date)} : votre demande de ${seats} place(s) n'a pas pu être enregistrée.`;
-    notifyUser(req.user.id, 'Plus de places disponibles', message);
+    await notifyUser(req.user.id, 'Plus de places disponibles', message);
     return res.status(409).json({ error: message, available: result.available });
   }
   if (result.error) return res.status(result.status).json({ error: result.error });
   res.status(201).json(result);
 });
 
-app.get('/api/bus-bookings', authenticateToken, (req, res) => {
-  res.json(db.prepare(`
+app.get('/api/bus-bookings', authenticateToken, async (req, res) => {
+  res.json(await db.all(`
     SELECT b.id, b.service_date, b.seats, b.created_at, l.name AS line_name
     FROM bus_bookings b JOIN bus_lines l ON b.line_id = l.id
     WHERE b.user_id = ?
     ORDER BY b.service_date DESC
-  `).all(req.user.id));
+  `, req.user.id));
 });
 
-app.delete('/api/bus-bookings/:id', authenticateToken, (req, res) => {
-  const result = db.prepare('DELETE FROM bus_bookings WHERE id = ? AND user_id = ?').run(req.params.id, req.user.id);
+app.delete('/api/bus-bookings/:id', authenticateToken, async (req, res) => {
+  const result = await db.run('DELETE FROM bus_bookings WHERE id = ? AND user_id = ?', req.params.id, req.user.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Booking not found' });
   res.json({ success: true });
 });
 
 // ── Admin: bus ────────────────────────────────────────────────────────────────
-app.get('/api/admin/bus-lines', authenticateAdmin, (req, res) => {
-  const lines = db.prepare('SELECT * FROM bus_lines ORDER BY name').all();
-  const upcoming = db.prepare(`
-    SELECT service_date, SUM(seats) AS reserved, COUNT(*) AS bookings
-    FROM bus_bookings WHERE line_id = ? AND service_date >= ?
-    GROUP BY service_date ORDER BY service_date
-  `);
-  const today = todayLocal();
-  res.json(lines.map(l => ({ ...l, active: !!l.active, upcoming: upcoming.all(l.id, today) })));
+app.get('/api/admin/bus-lines', authenticateAdmin, async (req, res) => {
+  const [lines, upcoming] = await Promise.all([
+    db.all('SELECT * FROM bus_lines ORDER BY name'),
+    db.all(`
+      SELECT line_id, service_date, SUM(seats) AS reserved, COUNT(*) AS bookings
+      FROM bus_bookings WHERE service_date >= ?
+      GROUP BY line_id, service_date ORDER BY service_date
+    `, todayLocal()),
+  ]);
+  res.json(lines.map(l => ({
+    ...l,
+    active: !!l.active,
+    upcoming: upcoming.filter(u => u.line_id === l.id).map(({ line_id, ...u }) => u),
+  })));
 });
 
 const validateLine = ({ name, seats }) => {
@@ -637,46 +575,46 @@ const validateLine = ({ name, seats }) => {
   return null;
 };
 
-app.post('/api/admin/bus-lines', authenticateAdmin, (req, res) => {
+app.post('/api/admin/bus-lines', authenticateAdmin, async (req, res) => {
   const name = req.body.name?.trim();
   const seats = parseInt(req.body.seats);
   const invalid = validateLine({ name, seats });
   if (invalid) return res.status(400).json({ error: invalid });
-  if (db.prepare('SELECT 1 FROM bus_lines WHERE name = ?').get(name)) return res.status(409).json({ error: 'Une ligne porte déjà ce nom' });
-  const result = db.prepare('INSERT INTO bus_lines (name, seats) VALUES (?, ?)').run(name, seats);
+  if (await db.get('SELECT 1 FROM bus_lines WHERE name = ?', name)) return res.status(409).json({ error: 'Une ligne porte déjà ce nom' });
+  const result = await db.run('INSERT INTO bus_lines (name, seats) VALUES (?, ?)', name, seats);
   res.status(201).json({ id: result.lastInsertRowid, name, seats, active: true, upcoming: [] });
 });
 
-app.put('/api/admin/bus-lines/:id', authenticateAdmin, (req, res) => {
-  const line = db.prepare('SELECT * FROM bus_lines WHERE id = ?').get(req.params.id);
+app.put('/api/admin/bus-lines/:id', authenticateAdmin, async (req, res) => {
+  const line = await db.get('SELECT * FROM bus_lines WHERE id = ?', req.params.id);
   if (!line) return res.status(404).json({ error: 'Ligne introuvable' });
   const name = req.body.name !== undefined ? req.body.name?.trim() : line.name;
   const seats = req.body.seats !== undefined ? parseInt(req.body.seats) : line.seats;
   const active = req.body.active !== undefined ? (req.body.active ? 1 : 0) : line.active;
   const invalid = validateLine({ name, seats });
   if (invalid) return res.status(400).json({ error: invalid });
-  if (db.prepare('SELECT 1 FROM bus_lines WHERE name = ? AND id != ?').get(name, line.id)) {
+  if (await db.get('SELECT 1 FROM bus_lines WHERE name = ? AND id != ?', name, line.id)) {
     return res.status(409).json({ error: 'Une ligne porte déjà ce nom' });
   }
   // On ne peut pas descendre sous les places déjà réservées pour un culte à venir
-  const maxReserved = db.prepare(`
+  const maxReserved = (await db.get(`
     SELECT COALESCE(MAX(total), 0) AS n FROM (
       SELECT SUM(seats) AS total FROM bus_bookings WHERE line_id = ? AND service_date >= ? GROUP BY service_date
-    )`).get(line.id, todayLocal()).n;
+    ) AS per_date`, line.id, todayLocal())).n;
   if (seats < maxReserved) {
     return res.status(409).json({ error: `Impossible : ${maxReserved} places sont déjà réservées pour un culte à venir` });
   }
-  db.prepare('UPDATE bus_lines SET name = ?, seats = ?, active = ? WHERE id = ?').run(name, seats, active, line.id);
+  await db.run('UPDATE bus_lines SET name = ?, seats = ?, active = ? WHERE id = ?', name, seats, active, line.id);
   res.json({ id: line.id, name, seats, active: !!active });
 });
 
-app.delete('/api/admin/bus-lines/:id', authenticateAdmin, (req, res) => {
-  const result = db.prepare('DELETE FROM bus_lines WHERE id = ?').run(req.params.id);
+app.delete('/api/admin/bus-lines/:id', authenticateAdmin, async (req, res) => {
+  const result = await db.run('DELETE FROM bus_lines WHERE id = ?', req.params.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Ligne introuvable' });
   res.json({ success: true });
 });
 
-app.get('/api/admin/bus-bookings', authenticateAdmin, (req, res) => {
+app.get('/api/admin/bus-bookings', authenticateAdmin, async (req, res) => {
   let query = `
     SELECT b.id, b.line_id, b.service_date, b.seats, b.created_at, l.name AS line_name,
            u.name AS user_name, u.first_name AS user_first_name, u.email AS user_email, u.phone AS user_phone
@@ -686,11 +624,11 @@ app.get('/api/admin/bus-bookings', authenticateAdmin, (req, res) => {
   if (req.query.line_id) { query += ' AND b.line_id = ?'; params.push(parseInt(req.query.line_id)); }
   if (isServiceDate(req.query.date)) { query += ' AND b.service_date = ?'; params.push(req.query.date); }
   query += ' ORDER BY b.service_date DESC, l.name, b.created_at';
-  res.json(db.prepare(query).all(...params));
+  res.json(await db.all(query, ...params));
 });
 
-app.delete('/api/admin/bus-bookings/:id', authenticateAdmin, (req, res) => {
-  const result = db.prepare('DELETE FROM bus_bookings WHERE id = ?').run(req.params.id);
+app.delete('/api/admin/bus-bookings/:id', authenticateAdmin, async (req, res) => {
+  const result = await db.run('DELETE FROM bus_bookings WHERE id = ?', req.params.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Booking not found' });
   res.json({ success: true });
 });
@@ -832,5 +770,17 @@ app.get('/api/transit/journey', async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
+// Erreurs imprévues (ex. MySQL indisponible) : réponse 500 propre, détail dans les logs uniquement
+app.use((err, req, res, next) => {
+  console.error(`${req.method} ${req.path} :`, err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Erreur interne du serveur' });
+});
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Serveur démarré sur le port ${PORT}`));
+initDatabase()
+  .then(() => app.listen(PORT, () => console.log(`Serveur démarré sur le port ${PORT}`)))
+  .catch((err) => {
+    console.error('Impossible d\'initialiser la base MySQL :', err.message);
+    process.exit(1);
+  });
