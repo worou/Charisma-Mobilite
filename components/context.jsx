@@ -18,6 +18,7 @@ export const AppProvider = ({ children }) => {
   const [searchResults, setSearchResults] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [searchParams, setSearchParams] = useState(null);
+  const [selectedTrip, setSelectedTrip] = useState(null);
   const [error, setError] = useState(null);
 
   const setToken = useCallback((t) => {
@@ -68,6 +69,50 @@ export const AppProvider = ({ children }) => {
     setError(null);
   }, []);
 
+  // Retour de connexion Google/GitHub : le backend renvoie le jeton (ou l'erreur) dans le fragment d'URL
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.hash.slice(1));
+    const oauthToken = params.get('oauth_token');
+    const oauthError = params.get('oauth_error');
+    if (!oauthToken && !oauthError) return;
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (oauthToken) {
+      setToken(oauthToken);
+    } else {
+      setError(oauthError);
+      setCurrentPage('login');
+    }
+  }, [setToken]);
+
+  // Notifications (ex. bus complet) : rechargées à la connexion puis toutes les minutes
+  const [notifications, setNotifications] = useState([]);
+
+  const refreshNotifications = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch('/api/notifications', { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) setNotifications(await res.json());
+    } catch {
+      /* réseau indisponible : on garde la liste actuelle */
+    }
+  }, [token]);
+
+  const markNotificationsRead = useCallback(async () => {
+    if (!token) return;
+    setNotifications((list) => list.map((n) => ({ ...n, is_read: 1 })));
+    await fetch('/api/notifications/read', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setNotifications([]);
+      return;
+    }
+    refreshNotifications();
+    const timer = setInterval(refreshNotifications, 60000);
+    return () => clearInterval(timer);
+  }, [isAuthenticated, refreshNotifications]);
+
   // Vérifier l'authentification au chargement
   useEffect(() => {
     if (token) {
@@ -103,11 +148,16 @@ export const AppProvider = ({ children }) => {
     setIsLoading,
     searchParams,
     setSearchParams,
+    selectedTrip,
+    setSelectedTrip,
     error,
     setError,
     clearError,
     login,
-    logout
+    logout,
+    notifications,
+    refreshNotifications,
+    markNotificationsRead
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

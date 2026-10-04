@@ -13,7 +13,7 @@ const Footer = () => {
             <div className="flex items-center mb-6">
               <Car className="h-8 w-8 text-purple-400 mr-2" />
               <span className="text-2xl font-bold bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
-                Charisma'Move
+                Charisma'Mobilité
               </span>
             </div>
             <p className="text-gray-400 mb-6 max-w-md">

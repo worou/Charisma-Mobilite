@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useApp } from './context.jsx';
 import Toast from './Toast';
+import OAuthButtons from './OAuthButtons';
 
 const RegisterPage = () => {
   const { setCurrentPage } = useApp();
@@ -99,7 +100,7 @@ const RegisterPage = () => {
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label htmlFor="name" className="block text-sm font-semibold text-gray-700 mb-2">
-              Nom * <span className="text-red-500">*</span>
+              Nom <span className="text-red-500">*</span>
             </label>
             <input
               type="text"
@@ -217,6 +218,10 @@ const RegisterPage = () => {
             {isLoading ? 'Inscription en cours...' : 'S\'inscrire'}
           </button>
         </form>
+
+        <div className="mt-6">
+          <OAuthButtons />
+        </div>
 
         <div className="mt-6 text-center">
           <p className="text-gray-600">

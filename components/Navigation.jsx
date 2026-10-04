@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Car, Home, Search, BookOpen, Heart, Calendar, Menu, X } from 'lucide-react';
 import { useApp } from './context.jsx';
+import NotificationBell from './NotificationBell';
 
 const Navigation = () => {
   const { currentPage, setCurrentPage, isAuthenticated } = useApp();
@@ -23,8 +24,8 @@ const Navigation = () => {
           <div className="flex items-center">
             <button onClick={() => setCurrentPage('home')} className="flex items-center">
               <Car className="h-8 w-8 text-purple-600 mr-2" />
-              <span className="text-2xl font-bold bg-gradient-to-r from-purple-600 to-pink-600 bg-clip-text text-transparent">
-                Charisma'Move
+              <span className="text-xl lg:text-2xl font-bold whitespace-nowrap bg-gradient-to-r from-purple-600 to-pink-600 bg-clip-text text-transparent">
+                Charisma'Mobilité
               </span>
             </button>
           </div>
@@ -50,9 +51,12 @@ const Navigation = () => {
           {/* Auth Buttons */}
           <div className="hidden md:flex items-center space-x-4">
             {isAuthenticated ? (
-              <button onClick={() => setCurrentPage('profile')} className="text-purple-600 hover:text-purple-800 font-medium">
-                Mon profil
-              </button>
+              <>
+                <NotificationBell />
+                <button onClick={() => setCurrentPage('profile')} className="text-purple-600 hover:text-purple-800 font-medium">
+                  Mon profil
+                </button>
+              </>
             ) : (
               <>
                 <button onClick={() => setCurrentPage('login')} className="text-purple-600 hover:text-purple-800 font-medium">
@@ -69,7 +73,8 @@ const Navigation = () => {
           </div>
 
           {/* Mobile menu button */}
-          <div className="md:hidden">
+          <div className="md:hidden flex items-center gap-2">
+            {isAuthenticated && <NotificationBell />}
             <button onClick={() => setIsMenuOpen(!isMenuOpen)} className="text-gray-500 hover:text-gray-600">
               {isMenuOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
             </button>

@@ -1,7 +1,9 @@
 import React, { Suspense, lazy } from 'react';
+import { useApp } from './context.jsx';
 import Navigation from './Navigation';
 import Footer from './Footer';
 import HomePage from './HomePage';
+
 const SearchResultsPage = lazy(() => import('./SearchResultsPage'));
 const AboutPage = lazy(() => import('./AboutPage'));
 const LoginPage = lazy(() => import('./LoginPage'));
@@ -10,7 +12,6 @@ const ProfilePage = lazy(() => import('./ProfilePage'));
 const PublishTripPage = lazy(() => import('./PublishTripPage'));
 const BookingPage = lazy(() => import('./BookingPage'));
 const MyBookingsPage = lazy(() => import('./MyBookingsPage'));
-import { useApp } from './context.jsx';
 
 const CharismaMoveApp = () => {
   const { currentPage } = useApp();

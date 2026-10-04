@@ -1,14 +1,17 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from './context.jsx';
 import Toast from './Toast';
+import OAuthButtons from './OAuthButtons';
 
 const LoginPage = () => {
-  const { login, setCurrentPage } = useApp();
+  const { login, setCurrentPage, error, clearError } = useApp();
   const [form, setForm] = useState({
     email: '',
     password: ''
   });
-  const [toast, setToast] = useState(null);
+  // Affiche l'erreur éventuelle d'un retour Google/GitHub
+  const [toast, setToast] = useState(() => (error ? { message: error, type: 'error' } : null));
+  useEffect(() => { clearError(); }, [clearError]);
   const [isLoading, setIsLoading] = useState(false);
 
   const showToast = (message, type = 'success') => setToast({ message, type });
@@ -94,6 +97,10 @@ const LoginPage = () => {
             {isLoading ? 'Connexion en cours...' : 'Se connecter'}
           </button>
         </form>
+
+        <div className="mt-6">
+          <OAuthButtons />
+        </div>
 
         <div className="mt-6 text-center">
           <p className="text-gray-600">
