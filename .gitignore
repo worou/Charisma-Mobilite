@@ -84,7 +84,7 @@ jspm_packages/
 
 # Gatsby files
 .cache/
-public
+# (public/ est le dossier des fichiers statiques de Vite : versionné)
 
 # Storybook build outputs
 .out

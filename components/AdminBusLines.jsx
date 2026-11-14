@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Plus, Pencil, Trash2, Check, X, Bus } from 'lucide-react';
+import { Plus, Pencil, Trash2, Check, X, Bus, ArrowUp, ArrowDown, MapPin, Flag, UserCheck, CheckCircle2 } from 'lucide-react';
 import { useAdmin } from './AdminContext.jsx';
 
 const formatDate = (iso) =>
@@ -8,14 +8,115 @@ const formatDate = (iso) =>
 const inputClass =
   'px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500';
 
+// validated_at est un horodatage UTC « AAAA-MM-JJ HH:MM:SS »
+const formatTime = (ts) =>
+  new Date(`${ts.replace(' ', 'T')}Z`).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+const personName = (u) => [u.first_name, u.name].filter(Boolean).join(' ');
+
+// Chauffeurs de la ligne : ils valident les QR codes des voyageurs à la montée
+const LineDrivers = ({ line, users, onAdd, onRemove }) => {
+  const available = users.filter(u => !line.drivers.some(d => d.id === u.id));
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {line.drivers.map(d => (
+        <span key={d.id} title={d.email} className="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded-full bg-purple-50 text-purple-700 text-xs font-medium">
+          <UserCheck className="w-3.5 h-3.5" /> {personName(d)}
+          <button onClick={() => onRemove(d)} className="p-0.5 rounded-full hover:bg-purple-100" title="Retirer ce chauffeur">
+            <X className="w-3 h-3" />
+          </button>
+        </span>
+      ))}
+      <select
+        value=""
+        onChange={e => e.target.value && onAdd(parseInt(e.target.value))}
+        className="text-xs border border-dashed border-gray-300 rounded-full px-2 py-0.5 text-gray-500 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 max-w-[11rem]"
+      >
+        <option value="">+ Chauffeur</option>
+        {available.map(u => <option key={u.id} value={u.id}>{personName(u)} ({u.email})</option>)}
+      </select>
+    </div>
+  );
+};
+
+const emptyLine = () => ({ name: '', seats: 50, stops: ['', ''] });
+
+// Arrêts du départ (premier) à la destination (dernier) ; les arrêts intermédiaires s'insèrent entre les deux
+const StopsEditor = ({ stops, onChange }) => {
+  const update = (i, value) => onChange(stops.map((s, j) => (j === i ? value : s)));
+  const remove = (i) => onChange(stops.filter((_, j) => j !== i));
+  const move = (i, delta) => {
+    const next = [...stops];
+    [next[i], next[i + delta]] = [next[i + delta], next[i]];
+    onChange(next);
+  };
+  const addStop = () => onChange([...stops.slice(0, -1), '', stops[stops.length - 1]]);
+  const last = stops.length - 1;
+
+  return (
+    <div className="space-y-2">
+      {stops.map((stop, i) => {
+        const label = i === 0 ? 'Départ' : i === last ? 'Destination' : `Arrêt ${i}`;
+        const Icon = i === 0 ? MapPin : i === last ? Flag : null;
+        return (
+          <div key={i} className="flex items-center gap-2">
+            <span className="w-24 shrink-0 flex items-center gap-1.5 text-xs font-medium text-gray-500">
+              {Icon ? <Icon className="w-3.5 h-3.5 text-blue-500" /> : <span className="w-3.5 h-3.5 flex justify-center"><span className="w-1.5 h-1.5 mt-1 rounded-full bg-gray-300" /></span>}
+              {label}
+            </span>
+            <input
+              type="text"
+              value={stop}
+              onChange={e => update(i, e.target.value)}
+              placeholder={i === 0 ? 'Ex. Gare de Sevran' : i === last ? 'Ex. Église Charisma' : "Nom de l'arrêt"}
+              className={`${inputClass} flex-1 min-w-0`}
+            />
+            <button type="button" onClick={() => move(i, -1)} disabled={i === 0}
+              className="p-1 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100 disabled:opacity-30 disabled:hover:bg-transparent" title="Monter">
+              <ArrowUp className="w-4 h-4" />
+            </button>
+            <button type="button" onClick={() => move(i, 1)} disabled={i === last}
+              className="p-1 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100 disabled:opacity-30 disabled:hover:bg-transparent" title="Descendre">
+              <ArrowDown className="w-4 h-4" />
+            </button>
+            <button type="button" onClick={() => remove(i)} disabled={stops.length <= 2}
+              className="p-1 rounded text-red-400 hover:text-red-600 hover:bg-red-50 disabled:opacity-30 disabled:hover:bg-transparent" title="Retirer l'arrêt">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        );
+      })}
+      <button type="button" onClick={addStop} className="ml-[6.5rem] flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800">
+        <Plus className="w-4 h-4" /> Ajouter un arrêt
+      </button>
+    </div>
+  );
+};
+
+// Arrêts affichés sous le nom de la ligne : « Départ → … → Destination »
+const StopsSummary = ({ stops }) =>
+  stops.length === 0 ? (
+    <p className="text-xs text-gray-400 mt-1">Aucun arrêt renseigné</p>
+  ) : (
+    <ol className="flex flex-wrap items-center gap-x-1 gap-y-0.5 mt-1 text-xs text-gray-500">
+      {stops.map((s, i) => (
+        <li key={i} className="flex items-center gap-1">
+          {i > 0 && <span className="text-gray-300">→</span>}
+          <span className={i === 0 || i === stops.length - 1 ? 'font-medium text-gray-700' : ''}>{s}</span>
+        </li>
+      ))}
+    </ol>
+  );
+
 const AdminBusLines = () => {
   const { token } = useAdmin();
   const [lines, setLines] = useState([]);
   const [bookings, setBookings] = useState([]);
+  const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [newLine, setNewLine] = useState({ name: '', seats: 50 });
-  const [editing, setEditing] = useState(null); // { id, name, seats }
+  const [newLine, setNewLine] = useState(emptyLine);
+  const [editing, setEditing] = useState(null); // { id, name, seats, stops }
   const [filter, setFilter] = useState({ line_id: '', date: '' });
 
   const api = useCallback(async (url, options = {}) => {
@@ -38,6 +139,7 @@ const AdminBusLines = () => {
   }, [api, filter]);
 
   useEffect(() => { loadLines().finally(() => setLoading(false)); }, [loadLines]);
+  useEffect(() => { api('/api/admin/users').then(setUsers).catch(() => {}); }, [api]);
   useEffect(() => { loadBookings(); }, [loadBookings]);
 
   const run = async (action) => {
@@ -55,13 +157,13 @@ const AdminBusLines = () => {
   const handleCreate = async (e) => {
     e.preventDefault();
     const ok = await run(() => api('/api/admin/bus-lines', { method: 'POST', body: JSON.stringify(newLine) }));
-    if (ok) setNewLine({ name: '', seats: 50 });
+    if (ok) setNewLine(emptyLine());
   };
 
   const handleSave = async () => {
     const ok = await run(() => api(`/api/admin/bus-lines/${editing.id}`, {
       method: 'PUT',
-      body: JSON.stringify({ name: editing.name, seats: editing.seats }),
+      body: JSON.stringify({ name: editing.name, seats: editing.seats, stops: editing.stops }),
     }));
     if (ok) setEditing(null);
   };
@@ -74,6 +176,14 @@ const AdminBusLines = () => {
     run(() => api(`/api/admin/bus-lines/${line.id}`, { method: 'DELETE' }));
   };
 
+  const addDriver = (line, userId) =>
+    run(() => api(`/api/admin/bus-lines/${line.id}/drivers/${userId}`, { method: 'PUT' }));
+
+  const removeDriver = (line, driver) => {
+    if (!confirm(`Retirer ${personName(driver)} des chauffeurs de la ligne « ${line.name} » ?`)) return;
+    run(() => api(`/api/admin/bus-lines/${line.id}/drivers/${driver.id}`, { method: 'DELETE' }));
+  };
+
   const deleteBooking = (b) => {
     if (!confirm(`Supprimer la réservation de ${b.user_first_name || ''} ${b.user_name} ?`)) return;
     run(() => api(`/api/admin/bus-bookings/${b.id}`, { method: 'DELETE' }));
@@ -84,33 +194,41 @@ const AdminBusLines = () => {
   return (
     <div className="space-y-6">
       {/* Création */}
-      <form onSubmit={handleCreate} className="bg-white rounded-xl border shadow-sm p-5 flex flex-wrap items-end gap-3">
-        <div className="flex-1 min-w-[200px]">
-          <label className="block text-xs font-medium text-gray-500 mb-1">Nom de la ligne</label>
-          <input
-            type="text"
-            placeholder="Ex. Ligne Nord – Cotonou"
-            value={newLine.name}
-            onChange={e => setNewLine({ ...newLine, name: e.target.value })}
-            className={`${inputClass} w-full`}
-            required
-          />
+      <form onSubmit={handleCreate} className="bg-white rounded-xl border shadow-sm p-5 space-y-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="flex-1 min-w-[200px]">
+            <label className="block text-xs font-medium text-gray-500 mb-1">Nom de la ligne</label>
+            <input
+              type="text"
+              placeholder="Ex. Ligne Nord – Cotonou"
+              value={newLine.name}
+              onChange={e => setNewLine({ ...newLine, name: e.target.value })}
+              className={`${inputClass} w-full`}
+              required
+            />
+          </div>
+          <div className="w-36">
+            <label className="block text-xs font-medium text-gray-500 mb-1">Places dans le bus</label>
+            <input
+              type="number"
+              min="1"
+              max="500"
+              value={newLine.seats}
+              onChange={e => setNewLine({ ...newLine, seats: parseInt(e.target.value) || '' })}
+              className={`${inputClass} w-full`}
+              required
+            />
+          </div>
         </div>
-        <div className="w-36">
-          <label className="block text-xs font-medium text-gray-500 mb-1">Places dans le bus</label>
-          <input
-            type="number"
-            min="1"
-            max="500"
-            value={newLine.seats}
-            onChange={e => setNewLine({ ...newLine, seats: parseInt(e.target.value) || '' })}
-            className={`${inputClass} w-full`}
-            required
-          />
+        <div>
+          <p className="text-xs font-medium text-gray-500 mb-2">Arrêts, du départ jusqu'à la destination</p>
+          <StopsEditor stops={newLine.stops} onChange={stops => setNewLine({ ...newLine, stops })} />
         </div>
-        <button type="submit" className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors">
-          <Plus className="w-4 h-4" /> Créer la ligne
-        </button>
+        <div className="flex justify-end">
+          <button type="submit" className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 transition-colors">
+            <Plus className="w-4 h-4" /> Créer la ligne
+          </button>
+        </div>
       </form>
 
       {error && <div className="bg-red-50 text-red-700 text-sm p-3 rounded-lg">{error}</div>}
@@ -125,6 +243,7 @@ const AdminBusLines = () => {
               <tr>
                 <th className={th}>Ligne</th>
                 <th className={th}>Places</th>
+                <th className={th}>Chauffeurs</th>
                 <th className={th}>Prochains cultes (réservées / places)</th>
                 <th className={th}>Statut</th>
                 <th className={`${th} text-right`}>Actions</th>
@@ -137,11 +256,17 @@ const AdminBusLines = () => {
                   <tr key={line.id} className="hover:bg-gray-50 align-top">
                     <td className="px-6 py-4">
                       {isEditing ? (
-                        <input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })} className={`${inputClass} w-full`} />
+                        <div className="space-y-3 min-w-[420px]">
+                          <input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })} className={`${inputClass} w-full`} />
+                          <StopsEditor stops={editing.stops} onChange={stops => setEditing({ ...editing, stops })} />
+                        </div>
                       ) : (
-                        <span className="flex items-center gap-2 text-sm font-medium text-gray-900">
-                          <Bus className="w-4 h-4 text-gray-400" /> {line.name}
-                        </span>
+                        <>
+                          <span className="flex items-center gap-2 text-sm font-medium text-gray-900">
+                            <Bus className="w-4 h-4 text-gray-400" /> {line.name}
+                          </span>
+                          <StopsSummary stops={line.stops} />
+                        </>
                       )}
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-900">
@@ -150,6 +275,9 @@ const AdminBusLines = () => {
                           onChange={e => setEditing({ ...editing, seats: parseInt(e.target.value) || '' })}
                           className={`${inputClass} w-24`} />
                       ) : line.seats}
+                    </td>
+                    <td className="px-6 py-4">
+                      <LineDrivers line={line} users={users} onAdd={id => addDriver(line, id)} onRemove={d => removeDriver(line, d)} />
                     </td>
                     <td className="px-6 py-4">
                       {line.upcoming.length === 0 ? (
@@ -194,7 +322,7 @@ const AdminBusLines = () => {
                         </>
                       ) : (
                         <>
-                          <button onClick={() => setEditing({ id: line.id, name: line.name, seats: line.seats })} className="text-blue-500 hover:text-blue-700 p-1 rounded hover:bg-blue-50" title="Modifier">
+                          <button onClick={() => setEditing({ id: line.id, name: line.name, seats: line.seats, stops: line.stops.length ? line.stops : ['', ''] })} className="text-blue-500 hover:text-blue-700 p-1 rounded hover:bg-blue-50" title="Modifier">
                             <Pencil className="w-4 h-4" />
                           </button>
                           <button onClick={() => handleDelete(line)} className="text-red-400 hover:text-red-600 p-1 rounded hover:bg-red-50 ml-1" title="Supprimer">
@@ -208,7 +336,7 @@ const AdminBusLines = () => {
               })}
               {lines.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-6 py-12 text-center text-gray-400 text-sm">
+                  <td colSpan={6} className="px-6 py-12 text-center text-gray-400 text-sm">
                     Aucune ligne. Créez la première ligne ci-dessus.
                   </td>
                 </tr>
@@ -242,6 +370,7 @@ const AdminBusLines = () => {
                 <th className={th}>Ligne</th>
                 <th className={th}>Culte</th>
                 <th className={th}>Places</th>
+                <th className={th}>Montée</th>
                 <th className={`${th} text-right`}>Actions</th>
               </tr>
             </thead>
@@ -255,6 +384,11 @@ const AdminBusLines = () => {
                   <td className="px-6 py-4 text-sm text-gray-900">{b.line_name}</td>
                   <td className="px-6 py-4 text-sm text-gray-600 whitespace-nowrap">{formatDate(b.service_date)}</td>
                   <td className="px-6 py-4 text-sm text-gray-900">{b.seats}</td>
+                  <td className="px-6 py-4 text-sm whitespace-nowrap">
+                    {b.validated_at ? (
+                      <span className="inline-flex items-center gap-1 text-green-700"><CheckCircle2 className="w-4 h-4" /> {formatTime(b.validated_at)}</span>
+                    ) : <span className="text-gray-400">—</span>}
+                  </td>
                   <td className="px-6 py-4 text-right">
                     <button onClick={() => deleteBooking(b)} className="text-red-400 hover:text-red-600 p-1 rounded hover:bg-red-50" title="Supprimer">
                       <Trash2 className="w-4 h-4" />
@@ -264,7 +398,7 @@ const AdminBusLines = () => {
               ))}
               {bookings.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-6 py-12 text-center text-gray-400 text-sm">Aucune réservation</td>
+                  <td colSpan={6} className="px-6 py-12 text-center text-gray-400 text-sm">Aucune réservation</td>
                 </tr>
               )}
             </tbody>

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Bus, Car, Calendar, Users, Trash2, ArrowRight } from 'lucide-react';
+import { Bus, Car, Calendar, Users, Trash2, ArrowRight, QrCode, X, CheckCircle2, Loader2 } from 'lucide-react';
 import { useApp } from './context.jsx';
 
 const formatServiceDate = (iso) =>
@@ -23,6 +23,55 @@ const Section = ({ icon: Icon, title, count, children }) => (
   </section>
 );
 
+// validated_at est un horodatage UTC « AAAA-MM-JJ HH:MM:SS »
+const formatTime = (ts) =>
+  new Date(`${ts.replace(' ', 'T')}Z`).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+// Billet à présenter au chauffeur : même QR code que dans l'email de confirmation
+function TicketModal({ booking, token, onClose }) {
+  const [ticket, setTicket] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    fetch(`/api/bus-bookings/${booking.id}/ticket`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then(setTicket)
+      .catch(() => setError('Impossible de charger le billet'));
+  }, [booking.id, token]);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm p-6 text-center" onClick={(e) => e.stopPropagation()}>
+        <div className="flex justify-end -mt-2 -mr-2">
+          <button onClick={onClose} className="p-1 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100" title="Fermer">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <p className="text-lg font-bold text-gray-900">Ligne « {booking.line_name} »</p>
+        <p className="text-sm text-gray-500 mt-1">
+          {formatServiceDate(booking.service_date)} · {booking.seats} place{booking.seats > 1 ? 's' : ''}
+        </p>
+        <div className="my-5 flex justify-center">
+          {error ? (
+            <p className="text-sm text-red-600">{error}</p>
+          ) : ticket ? (
+            <img src={ticket.qr} alt="QR code du billet" className={`w-64 h-64 ${ticket.validated_at ? 'opacity-30' : ''}`} />
+          ) : (
+            <div className="w-64 h-64 flex items-center justify-center"><Loader2 className="w-8 h-8 text-purple-600 animate-spin" /></div>
+          )}
+        </div>
+        {ticket?.validated_at ? (
+          <p className="flex items-center justify-center gap-1.5 text-sm font-semibold text-green-700">
+            <CheckCircle2 className="w-4 h-4" /> Validé à la montée à {formatTime(ticket.validated_at)}
+          </p>
+        ) : (
+          <p className="text-sm text-gray-600">Présentez ce QR code au chauffeur lors de la montée dans le bus.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const Empty = ({ children }) => (
   <p className="p-6 rounded-2xl border-2 border-dashed border-gray-200 text-center text-gray-500">{children}</p>
 );
@@ -31,6 +80,7 @@ export default function MyBookingsPage() {
   const { token, isAuthenticated, setCurrentPage } = useApp();
   const [bookings, setBookings] = useState([]);
   const [busBookings, setBusBookings] = useState([]);
+  const [ticketFor, setTicketFor] = useState(null);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -56,6 +106,7 @@ export default function MyBookingsPage() {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) setBusBookings((list) => list.filter((x) => x.id !== b.id));
+    else alert((await res.json().catch(() => ({}))).error || 'Annulation impossible');
   };
 
   if (!isAuthenticated) {
@@ -93,18 +144,33 @@ export default function MyBookingsPage() {
                       <p className="text-sm text-gray-500 flex flex-wrap items-center gap-x-4 gap-y-1 mt-1">
                         <span className="flex items-center gap-1.5"><Calendar className="w-4 h-4" /> {formatServiceDate(b.service_date)}</span>
                         <span className="flex items-center gap-1.5"><Users className="w-4 h-4" /> {b.seats} place{b.seats > 1 ? 's' : ''}</span>
+                        {b.validated_at && (
+                          <span className="flex items-center gap-1.5 text-green-700 font-medium">
+                            <CheckCircle2 className="w-4 h-4" /> Monté à {formatTime(b.validated_at)}
+                          </span>
+                        )}
                       </p>
                     </div>
-                    {past ? (
-                      <span className="shrink-0 px-2.5 py-1 rounded-full bg-gray-100 text-gray-500 text-xs font-medium">Passé</span>
-                    ) : (
-                      <button
-                        onClick={() => cancelBus(b)}
-                        className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-red-600 hover:bg-red-50 transition"
-                      >
-                        <Trash2 className="w-4 h-4" /> Annuler
-                      </button>
-                    )}
+                    <div className="shrink-0 flex items-center gap-1">
+                      {!past && (
+                        <button
+                          onClick={() => setTicketFor(b)}
+                          className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-purple-700 bg-purple-50 hover:bg-purple-100 transition"
+                        >
+                          <QrCode className="w-4 h-4" /> Billet
+                        </button>
+                      )}
+                      {past ? (
+                        <span className="px-2.5 py-1 rounded-full bg-gray-100 text-gray-500 text-xs font-medium">Passé</span>
+                      ) : !b.validated_at && (
+                        <button
+                          onClick={() => cancelBus(b)}
+                          className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-red-600 hover:bg-red-50 transition"
+                        >
+                          <Trash2 className="w-4 h-4" /> Annuler
+                        </button>
+                      )}
+                    </div>
                   </li>
                 );
               })}
@@ -131,6 +197,7 @@ export default function MyBookingsPage() {
           )}
         </Section>
       </div>
+      {ticketFor && <TicketModal booking={ticketFor} token={token} onClose={() => { setTicketFor(null); load(); }} />}
     </div>
   );
 }

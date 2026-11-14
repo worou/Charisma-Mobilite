@@ -29,7 +29,8 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      '/api': {
+      // « /api/ » et non « /api » : sinon le module /apiBase.js partirait aussi vers le backend
+      '/api/': {
         target: process.env.VITE_BACKEND_URL || 'http://localhost:3001',
         changeOrigin: true,
         secure: false,

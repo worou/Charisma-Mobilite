@@ -1,0 +1,17 @@
+# Charisma'Mobilité – front
+Options -Indexes
+RewriteEngine On
+# HTTPS obligatoire
+RewriteCond %{HTTPS} !=on
+RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+# /admin et /admin/... -> espace d'administration
+RewriteRule ^admin/?(.*)$ admin.html [L]
+# Pas de cartes de source en ligne
+<FilesMatch "\.map$">
+  Require all denied
+</FilesMatch>
+# Le service worker et le manifeste doivent toujours être relus (mises à jour de l'application)
+<FilesMatch "^(sw\.js|manifest\.webmanifest)$">
+  Header set Cache-Control "no-cache"
+</FilesMatch>
+AddType application/manifest+json .webmanifest

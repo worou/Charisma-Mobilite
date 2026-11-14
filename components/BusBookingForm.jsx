@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Bus, Calendar, Users, Church, CheckCircle2, AlertCircle, Loader2, ArrowRight } from 'lucide-react';
+import { Bus, Calendar, Users, Church, CheckCircle2, AlertCircle, Loader2, ArrowRight, MapPin } from 'lucide-react';
 import { useApp } from './context.jsx';
 
 const pad = (n) => String(n).padStart(2, '0');
@@ -168,6 +168,19 @@ export default function BusBookingForm() {
 
       {selected && (
         <div className="mt-4 ml-1">
+          {selected.stops.length > 0 && (
+            <div className="flex items-start gap-2 text-sm text-gray-600 mb-3">
+              <MapPin className="w-4 h-4 mt-0.5 text-purple-500 shrink-0" />
+              <ol className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                {selected.stops.map((stop, i) => (
+                  <li key={i} className="flex items-center gap-1.5">
+                    {i > 0 && <ArrowRight className="w-3.5 h-3.5 text-gray-300" />}
+                    <span className={i === 0 || i === selected.stops.length - 1 ? 'font-semibold text-gray-900' : ''}>{stop}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
           <div className="flex items-center justify-between text-xs text-gray-500 mb-1.5">
             <span>Remplissage de « {selected.name} » le {formatDate(date)}</span>
             <span className="font-semibold">{selected.reserved}/{selected.seats}</span>

@@ -5,8 +5,7 @@ import {
 } from 'lucide-react';
 import Toast from './Toast';
 import BusBookingForm from './BusBookingForm';
-import TrainItineraryForm from './TrainItineraryForm';
-import { useApp } from './context.jsx';
+import TrainItineraryForm from './TrainItineraryForm';import { useApp } from './context.jsx';
 
 const FEATURES = [
   { icon: Gift, title: '100 % gratuit', description: 'Aucun frais, aucune commission : tous les trajets sont offerts à la communauté.', color: 'from-pink-500 to-rose-500' },

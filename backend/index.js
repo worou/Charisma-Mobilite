@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const QRCode = require('qrcode');
 const db = require('./db');
 const { initSchema } = require('./schema');
 
@@ -39,6 +40,11 @@ for (const method of ['get', 'post', 'put', 'delete']) {
 // ── Database ──────────────────────────────────────────────────────────────────
 async function initDatabase() {
   await initSchema(db);
+
+  // Réservations de bus créées avant les billets : on leur attribue un code
+  for (const { id } of await db.all('SELECT id FROM bus_bookings WHERE ticket_code IS NULL')) {
+    await db.run('UPDATE bus_bookings SET ticket_code = ? WHERE id = ?', newTicketCode(), id);
+  }
 
   // Seed default admin
   const adminCount = await db.get('SELECT COUNT(*) as c FROM users WHERE is_admin = 1');
@@ -99,6 +105,9 @@ app.post('/api/items', async (req, res) => {
 });
 
 // ── User auth ─────────────────────────────────────────────────────────────────
+// Un compte est chauffeur dès que l'admin lui attribue au moins une ligne de bus
+const isDriver = async (userId) => !!(await db.get('SELECT 1 FROM bus_line_drivers WHERE user_id = ? LIMIT 1', userId));
+
 app.post('/api/users/register', async (req, res) => {
   const { name, first_name, gender, email, password, phone } = req.body;
   if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -120,14 +129,17 @@ app.post(['/api/users/login', '/api/auth/login'], async (req, res) => {
   const token = jwt.sign({ id: user.id, is_admin: !!user.is_admin }, JWT_SECRET, { expiresIn: '1h' });
   res.json({
     token,
-    user: { id: user.id, name: user.name, first_name: user.first_name, gender: user.gender, email: user.email, phone: user.phone, is_admin: !!user.is_admin },
+    user: {
+      id: user.id, name: user.name, first_name: user.first_name, gender: user.gender, email: user.email, phone: user.phone,
+      is_admin: !!user.is_admin, is_driver: await isDriver(user.id),
+    },
   });
 });
 
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   const user = await db.get('SELECT id, name, first_name, gender, email, phone, is_admin FROM users WHERE id = ?', req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  res.json({ user });
+  res.json({ user: { ...user, is_driver: await isDriver(user.id) } });
 });
 
 // ── OAuth (Google, GitHub) ────────────────────────────────────────────────────
@@ -457,8 +469,10 @@ const mailer = process.env.SMTP_HOST
     })
   : null;
 
-async function notifyUser(userId, title, message) {
+// email: false quand un email plus complet part à côté (billet de bus)
+async function notifyUser(userId, title, message, { email = true } = {}) {
   await db.run('INSERT INTO notifications (user_id, title, message) VALUES (?, ?, ?)', userId, title, message);
+  if (!email) return;
   const user = await db.get('SELECT email, first_name, name FROM users WHERE id = ?', userId);
   if (!mailer || !user) return;
   // Envoi en arrière-plan : un échec SMTP ne doit pas bloquer la réponse au voyageur
@@ -488,21 +502,99 @@ const todayLocal = () => {
 const formatServiceDate = (d) =>
   new Date(`${d}T12:00`).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 
+// ── Billets de bus (QR code) ──────────────────────────────────────────────────
+// Le QR code contient « CHARISMA-BUS:<code> » ; le code, aléatoire, est la seule preuve du billet.
+const TICKET_PREFIX = 'CHARISMA-BUS:';
+const newTicketCode = () => crypto.randomBytes(16).toString('base64url');
+const ticketQR = (code) => `${TICKET_PREFIX}${code}`;
+const parseTicketCode = (raw) => {
+  const code = String(raw ?? '').trim().replace(TICKET_PREFIX, '');
+  return /^[A-Za-z0-9_-]{8,32}$/.test(code) ? code : null;
+};
+
+const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+// Notification dans le site + email avec le QR code en image intégrée (cid : affichée par Gmail, Outlook…)
+async function sendBusTicket(bookingId) {
+  const b = await db.get(`
+    SELECT b.id, b.user_id, b.service_date, b.seats, b.ticket_code, l.name AS line_name, l.stops,
+           u.email, u.first_name, u.name
+    FROM bus_bookings b JOIN bus_lines l ON b.line_id = l.id JOIN users u ON b.user_id = u.id
+    WHERE b.id = ?`, bookingId);
+  if (!b) return;
+  const date = formatServiceDate(b.service_date);
+  const places = `${b.seats} place${b.seats > 1 ? 's' : ''}`;
+  const stops = parseStops(b.stops);
+  await notifyUser(b.user_id, 'Réservation confirmée',
+    `Votre réservation de ${places} sur la ligne « ${b.line_name} » pour le ${date} est confirmée. ` +
+    "Présentez votre QR code au chauffeur à la montée : il est dans l'email de confirmation et dans « Mes réservations ».",
+    { email: false });
+
+  if (!mailer) {
+    console.info(`SMTP non configuré : billet de la réservation ${b.id} non envoyé par email`);
+    return;
+  }
+  const qr = await QRCode.toBuffer(ticketQR(b.ticket_code), { width: 320, margin: 2 });
+  const hello = `Bonjour ${b.first_name || b.name},`;
+  const route = stops.length ? stops.join(' → ') : null;
+  await mailer.sendMail({
+    from: process.env.FROM_EMAIL || process.env.SMTP_USER,
+    to: b.email,
+    subject: `Charisma'Move – Votre billet de bus du ${date}`,
+    text: [
+      hello, '',
+      `Votre réservation est confirmée : ${places} sur la ligne « ${b.line_name} » pour le ${date}.`,
+      route ? `Trajet : ${route}` : null,
+      '',
+      'Présentez le QR code joint au chauffeur lors de la montée dans le bus.',
+      'Il est aussi disponible dans « Mes réservations » sur le site.',
+      '', "L'équipe Charisma'Move",
+    ].filter(l => l !== null).join('\n'),
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#111827">
+        <h2 style="color:#6d28d9;margin-bottom:4px">Réservation confirmée</h2>
+        <p>${escapeHtml(hello)}</p>
+        <p>Votre réservation pour le bus de l'Église est confirmée :</p>
+        <table style="border-collapse:collapse;margin:12px 0">
+          <tr><td style="padding:4px 12px 4px 0;color:#6b7280">Ligne</td><td><strong>${escapeHtml(b.line_name)}</strong></td></tr>
+          <tr><td style="padding:4px 12px 4px 0;color:#6b7280">Date</td><td><strong>${escapeHtml(date)}</strong></td></tr>
+          <tr><td style="padding:4px 12px 4px 0;color:#6b7280">Places</td><td><strong>${b.seats}</strong></td></tr>
+          ${route ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280">Trajet</td><td>${escapeHtml(route)}</td></tr>` : ''}
+        </table>
+        <p style="text-align:center;margin:24px 0 8px"><img src="cid:billet-qr" width="240" height="240" alt="QR code du billet"></p>
+        <p style="text-align:center;font-size:14px;color:#374151">Présentez ce QR code au chauffeur lors de la montée dans le bus.</p>
+        <p style="font-size:13px;color:#6b7280">Il est aussi disponible dans « Mes réservations » sur le site. Ne le partagez pas : il n'est valable qu'une fois.</p>
+        <p>L'équipe Charisma'Move</p>
+      </div>`,
+    attachments: [{ filename: 'billet-bus.png', content: qr, cid: 'billet-qr' }],
+  });
+}
+
 // q : db ou la transaction en cours
 const reservedSeats = async (lineId, date, q = db) =>
   (await q.get('SELECT COALESCE(SUM(seats), 0) AS n FROM bus_bookings WHERE line_id = ? AND service_date = ?', lineId, date)).n;
+
+// Arrêts stockés en JSON (texte) ; anciennes lignes sans arrêts -> []
+const parseStops = (raw) => {
+  try {
+    const stops = JSON.parse(raw || '[]');
+    return Array.isArray(stops) ? stops : [];
+  } catch {
+    return [];
+  }
+};
 
 // Lignes actives et places restantes pour une date donnée
 app.get('/api/bus-lines', async (req, res) => {
   const date = isServiceDate(req.query.date) ? req.query.date : null;
   const lines = await db.all(`
-    SELECT l.id, l.name, l.seats, COALESCE(SUM(b.seats), 0) AS reserved
+    SELECT l.id, l.name, l.seats, l.stops, COALESCE(SUM(b.seats), 0) AS reserved
     FROM bus_lines l LEFT JOIN bus_bookings b ON b.line_id = l.id AND b.service_date = ?
     WHERE l.active = 1
-    GROUP BY l.id, l.name, l.seats
+    GROUP BY l.id, l.name, l.seats, l.stops
     ORDER BY l.name
   `, date);
-  res.json(lines.map(l => ({ ...l, available: Math.max(l.seats - l.reserved, 0) })));
+  res.json(lines.map(l => ({ ...l, stops: parseStops(l.stops), available: Math.max(l.seats - l.reserved, 0) })));
 });
 
 // Vérification et insertion dans la même transaction. FOR UPDATE verrouille la ligne :
@@ -512,7 +604,8 @@ const bookBus = (userId, lineId, date, seats) => db.transaction(async (tx) => {
   if (!line) return { status: 404, error: 'Ligne introuvable' };
   const available = Math.max(line.seats - await reservedSeats(lineId, date, tx), 0);
   if (seats > available) return { status: 409, full: true, line, available };
-  const result = await tx.run('INSERT INTO bus_bookings (line_id, user_id, service_date, seats) VALUES (?, ?, ?, ?)', lineId, userId, date, seats);
+  const result = await tx.run('INSERT INTO bus_bookings (line_id, user_id, service_date, seats, ticket_code) VALUES (?, ?, ?, ?, ?)',
+    lineId, userId, date, seats, newTicketCode());
   return { booking: { id: result.lastInsertRowid, line_id: lineId, line_name: line.name, service_date: date, seats }, available: available - seats };
 });
 
@@ -534,55 +627,147 @@ app.post('/api/bus-bookings', authenticateToken, async (req, res) => {
     return res.status(409).json({ error: message, available: result.available });
   }
   if (result.error) return res.status(result.status).json({ error: result.error });
+  // Envoi en arrière-plan : un échec SMTP ne doit pas annuler la réservation
+  sendBusTicket(result.booking.id).catch(err => console.error('Billet non envoyé :', err.message));
   res.status(201).json(result);
 });
 
 app.get('/api/bus-bookings', authenticateToken, async (req, res) => {
   res.json(await db.all(`
-    SELECT b.id, b.service_date, b.seats, b.created_at, l.name AS line_name
+    SELECT b.id, b.service_date, b.seats, b.created_at, b.validated_at, l.name AS line_name
     FROM bus_bookings b JOIN bus_lines l ON b.line_id = l.id
     WHERE b.user_id = ?
     ORDER BY b.service_date DESC
   `, req.user.id));
 });
 
+// QR code du billet, affiché dans « Mes réservations »
+app.get('/api/bus-bookings/:id/ticket', authenticateToken, async (req, res) => {
+  const b = await db.get('SELECT ticket_code, validated_at FROM bus_bookings WHERE id = ? AND user_id = ?', req.params.id, req.user.id);
+  if (!b) return res.status(404).json({ error: 'Booking not found' });
+  res.json({ qr: await QRCode.toDataURL(ticketQR(b.ticket_code), { width: 320, margin: 2 }), validated_at: b.validated_at });
+});
+
 app.delete('/api/bus-bookings/:id', authenticateToken, async (req, res) => {
-  const result = await db.run('DELETE FROM bus_bookings WHERE id = ? AND user_id = ?', req.params.id, req.user.id);
-  if (result.changes === 0) return res.status(404).json({ error: 'Booking not found' });
+  // Un billet déjà validé à la montée ne peut plus être annulé
+  const result = await db.run('DELETE FROM bus_bookings WHERE id = ? AND user_id = ? AND validated_at IS NULL', req.params.id, req.user.id);
+  if (result.changes === 0) {
+    const exists = await db.get('SELECT 1 FROM bus_bookings WHERE id = ? AND user_id = ?', req.params.id, req.user.id);
+    return exists
+      ? res.status(409).json({ error: 'Ce billet a déjà été validé à la montée' })
+      : res.status(404).json({ error: 'Booking not found' });
+  }
   res.json({ success: true });
+});
+
+// ── Chauffeurs : validation des billets ───────────────────────────────────────
+// Lignes attribuées au chauffeur, avec le remplissage du jour
+app.get('/api/driver/lines', authenticateToken, async (req, res) => {
+  const today = todayLocal();
+  const lines = await db.all(`
+    SELECT l.id, l.name, l.seats, l.stops, l.active,
+           COUNT(b.id) AS bookings,
+           COALESCE(SUM(b.seats), 0) AS reserved,
+           COALESCE(SUM(CASE WHEN b.validated_at IS NOT NULL THEN b.seats ELSE 0 END), 0) AS boarded
+    FROM bus_line_drivers d
+    JOIN bus_lines l ON l.id = d.line_id
+    LEFT JOIN bus_bookings b ON b.line_id = l.id AND b.service_date = ?
+    WHERE d.user_id = ?
+    GROUP BY l.id, l.name, l.seats, l.stops, l.active
+    ORDER BY l.name`, today, req.user.id);
+  res.json({ date: today, lines: lines.map(l => ({ ...l, active: !!l.active, stops: parseStops(l.stops) })) });
+});
+
+const isLineDriver = async (lineId, userId) =>
+  !!(await db.get('SELECT 1 FROM bus_line_drivers WHERE line_id = ? AND user_id = ?', lineId, userId));
+
+// Voyageurs du jour sur une ligne du chauffeur
+app.get('/api/driver/lines/:id/passengers', authenticateToken, async (req, res) => {
+  if (!await isLineDriver(req.params.id, req.user.id)) return res.status(403).json({ error: 'Cette ligne ne vous est pas attribuée' });
+  res.json(await db.all(`
+    SELECT b.id, b.seats, b.validated_at, u.name AS user_name, u.first_name AS user_first_name
+    FROM bus_bookings b JOIN users u ON b.user_id = u.id
+    WHERE b.line_id = ? AND b.service_date = ?
+    ORDER BY u.name, u.first_name`, req.params.id, todayLocal()));
+});
+
+// Scan du QR code à la montée : billet du jour, sur une ligne du chauffeur, validable une seule fois
+app.post('/api/driver/validate', authenticateToken, async (req, res) => {
+  const code = parseTicketCode(req.body.code);
+  if (!code) return res.status(400).json({ error: "Ce QR code n'est pas un billet Charisma'Move" });
+  const b = await db.get(`
+    SELECT b.id, b.line_id, b.service_date, b.seats, b.validated_at, l.name AS line_name,
+           u.name AS user_name, u.first_name AS user_first_name
+    FROM bus_bookings b JOIN bus_lines l ON b.line_id = l.id JOIN users u ON b.user_id = u.id
+    WHERE b.ticket_code = ?`, code);
+  if (!b) return res.status(404).json({ error: 'Billet inconnu ou réservation annulée' });
+  const ticket = {
+    id: b.id, line_id: b.line_id, line_name: b.line_name, service_date: b.service_date, seats: b.seats,
+    user_name: b.user_name, user_first_name: b.user_first_name, validated_at: b.validated_at,
+  };
+  if (!await isLineDriver(b.line_id, req.user.id)) {
+    return res.status(403).json({ error: `Ce billet est pour la ligne « ${b.line_name} », qui ne vous est pas attribuée`, ticket });
+  }
+  if (b.service_date !== todayLocal()) {
+    return res.status(409).json({ error: `Ce billet est valable le ${formatServiceDate(b.service_date)}, pas aujourd'hui`, ticket });
+  }
+  // La condition validated_at IS NULL empêche deux validations du même billet, même simultanées
+  const result = await db.run(
+    'UPDATE bus_bookings SET validated_at = CURRENT_TIMESTAMP, validated_by = ? WHERE id = ? AND validated_at IS NULL',
+    req.user.id, b.id);
+  const { validated_at } = await db.get('SELECT validated_at FROM bus_bookings WHERE id = ?', b.id);
+  if (result.changes === 0) {
+    return res.status(409).json({ error: 'Billet déjà validé', already_validated: true, ticket: { ...ticket, validated_at } });
+  }
+  res.json({ ticket: { ...ticket, validated_at } });
 });
 
 // ── Admin: bus ────────────────────────────────────────────────────────────────
 app.get('/api/admin/bus-lines', authenticateAdmin, async (req, res) => {
-  const [lines, upcoming] = await Promise.all([
+  const [lines, upcoming, drivers] = await Promise.all([
     db.all('SELECT * FROM bus_lines ORDER BY name'),
     db.all(`
       SELECT line_id, service_date, SUM(seats) AS reserved, COUNT(*) AS bookings
       FROM bus_bookings WHERE service_date >= ?
       GROUP BY line_id, service_date ORDER BY service_date
     `, todayLocal()),
+    db.all(`
+      SELECT d.line_id, u.id, u.name, u.first_name, u.email
+      FROM bus_line_drivers d JOIN users u ON d.user_id = u.id
+      ORDER BY u.name, u.first_name`),
   ]);
   res.json(lines.map(l => ({
     ...l,
+    stops: parseStops(l.stops),
     active: !!l.active,
     upcoming: upcoming.filter(u => u.line_id === l.id).map(({ line_id, ...u }) => u),
+    drivers: drivers.filter(d => d.line_id === l.id).map(({ line_id, ...d }) => d),
   })));
 });
 
-const validateLine = ({ name, seats }) => {
+// Liste ordonnée d'arrêts : du départ à la destination. Les champs laissés vides sont ignorés.
+const normalizeStops = (stops) =>
+  Array.isArray(stops) ? stops.map(s => String(s ?? '').trim()).filter(Boolean) : null;
+
+const validateLine = ({ name, seats, stops }) => {
   if (!name?.trim()) return 'Le nom de la ligne est requis';
   if (!Number.isInteger(seats) || seats < 1 || seats > 500) return 'Le nombre de places doit être entre 1 et 500';
+  if (!stops) return "Liste d'arrêts invalide";
+  if (stops.length === 1) return 'Indiquez au moins un point de départ et une destination';
+  if (stops.length > 50) return 'Une ligne ne peut pas dépasser 50 arrêts';
+  if (stops.some(s => s.length > 255)) return "Le nom d'un arrêt ne peut pas dépasser 255 caractères";
   return null;
 };
 
 app.post('/api/admin/bus-lines', authenticateAdmin, async (req, res) => {
   const name = req.body.name?.trim();
   const seats = parseInt(req.body.seats);
-  const invalid = validateLine({ name, seats });
+  const stops = normalizeStops(req.body.stops ?? []);
+  const invalid = validateLine({ name, seats, stops });
   if (invalid) return res.status(400).json({ error: invalid });
   if (await db.get('SELECT 1 FROM bus_lines WHERE name = ?', name)) return res.status(409).json({ error: 'Une ligne porte déjà ce nom' });
-  const result = await db.run('INSERT INTO bus_lines (name, seats) VALUES (?, ?)', name, seats);
-  res.status(201).json({ id: result.lastInsertRowid, name, seats, active: true, upcoming: [] });
+  const result = await db.run('INSERT INTO bus_lines (name, seats, stops) VALUES (?, ?, ?)', name, seats, JSON.stringify(stops));
+  res.status(201).json({ id: result.lastInsertRowid, name, seats, stops, active: true, upcoming: [], drivers: [] });
 });
 
 app.put('/api/admin/bus-lines/:id', authenticateAdmin, async (req, res) => {
@@ -591,7 +776,8 @@ app.put('/api/admin/bus-lines/:id', authenticateAdmin, async (req, res) => {
   const name = req.body.name !== undefined ? req.body.name?.trim() : line.name;
   const seats = req.body.seats !== undefined ? parseInt(req.body.seats) : line.seats;
   const active = req.body.active !== undefined ? (req.body.active ? 1 : 0) : line.active;
-  const invalid = validateLine({ name, seats });
+  const stops = req.body.stops !== undefined ? normalizeStops(req.body.stops) : parseStops(line.stops);
+  const invalid = validateLine({ name, seats, stops });
   if (invalid) return res.status(400).json({ error: invalid });
   if (await db.get('SELECT 1 FROM bus_lines WHERE name = ? AND id != ?', name, line.id)) {
     return res.status(409).json({ error: 'Une ligne porte déjà ce nom' });
@@ -604,8 +790,22 @@ app.put('/api/admin/bus-lines/:id', authenticateAdmin, async (req, res) => {
   if (seats < maxReserved) {
     return res.status(409).json({ error: `Impossible : ${maxReserved} places sont déjà réservées pour un culte à venir` });
   }
-  await db.run('UPDATE bus_lines SET name = ?, seats = ?, active = ? WHERE id = ?', name, seats, active, line.id);
-  res.json({ id: line.id, name, seats, active: !!active });
+  await db.run('UPDATE bus_lines SET name = ?, seats = ?, stops = ?, active = ? WHERE id = ?',
+    name, seats, JSON.stringify(stops), active, line.id);
+  res.json({ id: line.id, name, seats, stops, active: !!active });
+});
+
+// Attribuer / retirer un chauffeur sur une ligne
+app.put('/api/admin/bus-lines/:id/drivers/:userId', authenticateAdmin, async (req, res) => {
+  if (!await db.get('SELECT 1 FROM bus_lines WHERE id = ?', req.params.id)) return res.status(404).json({ error: 'Ligne introuvable' });
+  if (!await db.get('SELECT 1 FROM users WHERE id = ?', req.params.userId)) return res.status(404).json({ error: 'Utilisateur introuvable' });
+  await db.run('INSERT IGNORE INTO bus_line_drivers (line_id, user_id) VALUES (?, ?)', req.params.id, req.params.userId);
+  res.json({ success: true });
+});
+
+app.delete('/api/admin/bus-lines/:id/drivers/:userId', authenticateAdmin, async (req, res) => {
+  await db.run('DELETE FROM bus_line_drivers WHERE line_id = ? AND user_id = ?', req.params.id, req.params.userId);
+  res.json({ success: true });
 });
 
 app.delete('/api/admin/bus-lines/:id', authenticateAdmin, async (req, res) => {
@@ -616,7 +816,7 @@ app.delete('/api/admin/bus-lines/:id', authenticateAdmin, async (req, res) => {
 
 app.get('/api/admin/bus-bookings', authenticateAdmin, async (req, res) => {
   let query = `
-    SELECT b.id, b.line_id, b.service_date, b.seats, b.created_at, l.name AS line_name,
+    SELECT b.id, b.line_id, b.service_date, b.seats, b.created_at, b.validated_at, l.name AS line_name,
            u.name AS user_name, u.first_name AS user_first_name, u.email AS user_email, u.phone AS user_phone
     FROM bus_bookings b JOIN bus_lines l ON b.line_id = l.id JOIN users u ON b.user_id = u.id
     WHERE 1=1`;

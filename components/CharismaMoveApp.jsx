@@ -12,6 +12,7 @@ const ProfilePage = lazy(() => import('./ProfilePage'));
 const PublishTripPage = lazy(() => import('./PublishTripPage'));
 const BookingPage = lazy(() => import('./BookingPage'));
 const MyBookingsPage = lazy(() => import('./MyBookingsPage'));
+const DriverPage = lazy(() => import('./DriverPage'));
 
 const CharismaMoveApp = () => {
   const { currentPage } = useApp();
@@ -36,6 +37,8 @@ const CharismaMoveApp = () => {
         return <BookingPage />;
       case 'my-bookings':
         return <MyBookingsPage />;
+      case 'driver':
+        return <DriverPage />;
       default:
         return <HomePage />;
     }
